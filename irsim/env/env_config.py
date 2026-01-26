@@ -4,6 +4,7 @@ from operator import attrgetter
 from typing import TYPE_CHECKING, Any, Optional
 
 import yaml
+import os
 
 from irsim.util.util import file_check
 from irsim.world import World
@@ -33,10 +34,16 @@ class EnvConfig:
         world_name: Optional[str],
         env_param_instance: Optional[EnvParam] = None,
         world_param_instance: Optional[WorldParam] = None,
+        house_expo_path: Optional[str] = None,
+        house_expo_map_name: Optional[str] = None,
     ) -> None:
         self.object_factory = ObjectFactory()
         self._env_param = env_param_instance
         self._world_param = world_param_instance
+        self.house_expo_path = house_expo_path
+        self.house_expo_map_name = house_expo_map_name
+
+
         self.load_yaml(world_name)
 
     def load_yaml(self, world_name: Optional[str] = None) -> None:
@@ -90,10 +97,16 @@ class EnvConfig:
               during in-place reloads.
         """
 
+        world_kwargs = dict(self.parse["world"])  # copy
+        if self.house_expo_path is not None:
+            world_kwargs["obstacle_map"] = os.path.join(
+                self.house_expo_path, "png", self.house_expo_map_name + ".png"
+            )
+
         world = World(
             self.world_name,
             world_param_instance=self._world_param,
-            **self.parse["world"],
+            **world_kwargs,
         )
 
         robot_collection = self.object_factory.create_from_parse(
@@ -147,10 +160,16 @@ class EnvConfig:
             Tuple: ``(world, objects, env_plot, robot_collection, obstacle_collection, map_collection)``
         """
 
+        world_kwargs = dict(self.parse["world"])  # copy
+        if self.house_expo_path is not None:
+            world_kwargs["obstacle_map"] = os.path.join(
+                self.house_expo_path, "png", self.house_expo_map_name + ".png"
+            )
+
         world = World(
             self.world_name,
             world_param_instance=self._world_param,
-            **self.parse["world"],
+            **world_kwargs,
         )
 
         robot_collection = self.object_factory.create_from_parse(

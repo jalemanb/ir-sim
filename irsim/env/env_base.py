@@ -143,6 +143,8 @@ class EnvBase:
         log_file: Optional[str] = None,
         log_level: str = "INFO",
         seed: Optional[int] = None,
+        house_expo_path: Optional[str] = None,
+        house_expo_map_name: Optional[str] = None,
     ) -> None:
         # Bind per-instance config objects
         self._env_param = EnvParam()
@@ -169,6 +171,8 @@ class EnvBase:
                 world_name,
                 env_param_instance=self._env_param,
                 world_param_instance=self._world_param,
+                house_expo_path=house_expo_path,
+                house_expo_map_name=house_expo_map_name,
             )
         except Exception as e:
             self.logger.critical(f"YAML Configuration load failed: {e}")
