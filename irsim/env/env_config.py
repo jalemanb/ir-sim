@@ -3,7 +3,7 @@ from __future__ import annotations
 from operator import attrgetter
 from typing import TYPE_CHECKING, Any, Optional
 
-import yaml
+import yaml, json
 import os
 
 from irsim.util.util import file_check
@@ -102,6 +102,10 @@ class EnvConfig:
             world_kwargs["obstacle_map"] = os.path.join(
                 self.house_expo_path, "png", self.house_expo_map_name + ".png"
             )
+            with open(os.path.join(self.house_expo_path, "json", self.house_expo_map_name + ".json"), "r", encoding="utf-8") as f:
+                world_kwargs["map_attr"]  = json.load(f)
+            # world_kwargs["height"]
+            # world_kwargs["width"]
 
         world = World(
             self.world_name,
@@ -165,6 +169,10 @@ class EnvConfig:
             world_kwargs["obstacle_map"] = os.path.join(
                 self.house_expo_path, "png", self.house_expo_map_name + ".png"
             )
+            with open(os.path.join(self.house_expo_path, "json", self.house_expo_map_name + ".json"), "r", encoding="utf-8") as f:
+                world_kwargs["map_attr"]  = json.load(f)
+            # world_kwargs["height"]
+            # world_kwargs["width"]
 
         world = World(
             self.world_name,
