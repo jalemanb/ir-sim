@@ -71,6 +71,7 @@ class EnvConfig:
             "gui": {},
             "robot": None,
             "obstacle": None,
+            "jupedsim": {},  # JuPedSim pedestrian simulation config
         }
 
         self.world_file_path = self.world_file_path

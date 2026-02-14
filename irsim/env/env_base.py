@@ -31,8 +31,17 @@ from irsim.lib import random_generate_polygon
 from irsim.util.random import rng, set_seed
 from irsim.util.util import normalize_actions, to_numpy
 from irsim.world import ObjectBase, ObjectFactory
+from irsim.world.obstacles import ObstaclePedestrian
 
 from .env_logger import EnvLogger
+
+# JuPedSim integration - optional dependency
+try:
+    from irsim.world.jupedsim_manager import JuPedSimManager
+    JUPEDSIM_AVAILABLE = True
+except ImportError:
+    JuPedSimManager = None
+    JUPEDSIM_AVAILABLE = False
 
 try:
     from irsim.gui.keyboard_control import KeyboardControl
@@ -228,6 +237,11 @@ class EnvBase:
             f"Simulation environment '{self._world.name}' started. Step time {self._world.step_time:.3f} s."
         )
 
+        # Initialize JuPedSim if configured
+        self.jupedsim_manager = None
+        self.pedestrian_objects = {}  # Maps jupedsim_id -> ObstaclePedestrian
+        self._init_jupedsim()
+
     def __del__(self):
         """Clean up resources when the environment is garbage-collected.
 
@@ -319,6 +333,11 @@ class EnvBase:
         self._objects_step(action, sensor_step=False)
         self._objects_sensor_step()
         self._world.step()
+
+        # Step JuPedSim pedestrians
+        if self.jupedsim_manager is not None:
+            self._step_jupedsim()
+
         self._status_step()
 
     def _objects_step(self, action: list[Any], sensor_step: bool = True) -> None:
@@ -1161,6 +1180,115 @@ class EnvBase:
         for group in self._object_groups:
             if hasattr(group, "group_behavior") and group.group_behavior is not None:
                 group.group_behavior._init_group_behavior_class()
+
+    def _init_jupedsim(self) -> None:
+        """Initialize JuPedSim manager and spawn pedestrians if configured."""
+        # Check if JuPedSim configuration exists
+        jupedsim_config = self.env_config.parse.get("jupedsim", {})
+        if not jupedsim_config.get("enabled", False):
+            return
+
+        if not JUPEDSIM_AVAILABLE:
+            self.logger.warning(
+                "JuPedSim is enabled in config but not installed. "
+                "Install with: pip install jupedsim"
+            )
+            return
+
+        # Check if we have HouseExpo map data
+        if not hasattr(self._world, 'map_attr') or self._world.map_attr is None:
+            self.logger.warning(
+                "JuPedSim requires HouseExpo map data. "
+                "Please configure house_expo_path and house_expo_map_name."
+            )
+            return
+
+        try:
+            # Create JuPedSim manager
+            # Use JuPedSim-specific step_time if provided, otherwise use world step_time
+            jupedsim_step_time = jupedsim_config.get("step_time", self._world.step_time)
+
+            self.jupedsim_manager = JuPedSimManager(
+                map_attr=self._world.map_attr,
+                step_time=jupedsim_step_time,
+                persons_per_room=jupedsim_config.get("persons_per_room", 2),
+                pedestrian_radius=jupedsim_config.get("pedestrian_radius", 0.3),
+                pedestrian_speed=jupedsim_config.get("pedestrian_speed", 1.2),
+                reach_distance=jupedsim_config.get("reach_distance", 0.5),
+                wall_margin=jupedsim_config.get("wall_margin", 0.5),
+                avoid_robots=jupedsim_config.get("avoid_robots", True),
+                seed=jupedsim_config.get("seed", None),
+                room_overrides=jupedsim_config.get("room_overrides", None),
+            )
+
+            # Get robot positions and dimensions to avoid spawning on top of them
+            robot_positions = []
+            for robot in self.robot_list:
+                radius = getattr(robot, 'radius', 0.5)  # Default 0.5m if not found
+                robot_positions.append((robot.state[0], robot.state[1], radius))
+
+            # Spawn pedestrians
+            num_spawned = self.jupedsim_manager.spawn_pedestrians(
+                exclude_positions=robot_positions
+            )
+
+            # Create ObstaclePedestrian objects for each JuPedSim agent
+            description = jupedsim_config.get("description", None)
+            for agent_id in self.jupedsim_manager.agent_ids:
+                agent_state = self.jupedsim_manager.sim.agent(agent_id)
+                pos = agent_state.position
+
+                pedestrian = ObstaclePedestrian(
+                    jupedsim_id=agent_id,
+                    name=f"pedestrian_{agent_id}",
+                    color=jupedsim_config.get("color", "orange"),
+                    shape={
+                        "name": "circle",
+                        "radius": self.jupedsim_manager.pedestrian_radius,
+                    },
+                    state=[pos[0], pos[1], 0.0],
+                    description=description,
+                )
+
+                self.pedestrian_objects[agent_id] = pedestrian
+                self.add_object(pedestrian)
+
+                # Initialize plotting for the pedestrian
+                if not self.disable_all_plot and hasattr(self, '_env_plot'):
+                    pedestrian._init_plot(self._env_plot.ax)
+
+            self.logger.info(
+                f"JuPedSim initialized with {num_spawned} pedestrians"
+            )
+
+        except Exception as e:
+            self.logger.error(f"Failed to initialize JuPedSim: {e}")
+            self.jupedsim_manager = None
+
+    def _step_jupedsim(self) -> None:
+        """Step JuPedSim simulation and update pedestrian objects."""
+        if self.jupedsim_manager is None:
+            return
+
+        # Update robot positions as obstacles if avoidance is enabled
+        if self.jupedsim_manager.avoid_robots and len(self.robot_list) > 0:
+            robot_obstacles = []
+            for robot in self.robot_list:
+                # Get robot radius (from shape)
+                radius = getattr(robot, 'radius', 0.5)  # Default 0.5m if not found
+                robot_obstacles.append((robot.state[0], robot.state[1], radius))
+            self.jupedsim_manager.update_robot_obstacles(robot_obstacles)
+
+        # Step JuPedSim simulation
+        self.jupedsim_manager.step()
+
+        # Update all pedestrian objects
+        agent_states = self.jupedsim_manager.get_agent_states()
+        for agent_id, (position, velocity) in agent_states.items():
+            if agent_id in self.pedestrian_objects:
+                self.pedestrian_objects[agent_id].update_from_jupedsim(
+                    position, velocity
+                )
 
     # region: property
     @property

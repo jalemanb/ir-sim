@@ -6,11 +6,13 @@ This package contains different obstacle types:
 - obstacle_omni: Omnidirectional obstacle
 - obstacle_acker: Ackermann steering obstacle
 - obstacle_static: Static obstacle
+- obstacle_pedestrian: Pedestrian controlled by JuPedSim
 """
 
 from .obstacle_acker import ObstacleAcker
 from .obstacle_diff import ObstacleDiff
 from .obstacle_omni import ObstacleOmni
+from .obstacle_pedestrian import ObstaclePedestrian
 from .obstacle_static import ObjectStatic
 
-__all__ = ["ObjectStatic", "ObstacleAcker", "ObstacleDiff", "ObstacleOmni"]
+__all__ = ["ObjectStatic", "ObstacleAcker", "ObstacleDiff", "ObstacleOmni", "ObstaclePedestrian"]

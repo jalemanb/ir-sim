@@ -1,0 +1,66 @@
+# Example configuration for ir-sim with JuPedSim pedestrian simulation
+# This example shows how to use JuPedSim with HouseExpo environments
+
+world:
+  step_time: 0.05  # 20Hz simulation - faster for smoother pedestrian movement
+  sample_time: 0.1  # 10Hz rendering
+  offset: [0, 0]
+  collision_mode: 'stop'  # Robot stops on collision with pedestrians
+  control_mode: 'auto'  # or 'keyboard' for manual control
+  mdownsample: 4
+
+# JuPedSim Configuration
+jupedsim:
+  enabled: true  # Enable pedestrian simulation
+  persons_per_room: 2  # Default: 2 people per room
+  pedestrian_radius: 0.3  # 30cm radius (typical human)
+  pedestrian_speed: 1.2  # 1.2 m/s walking speed
+  reach_distance: 0.5  # Reassign goal when within 0.5m
+  seed: 42  # For reproducible simulations
+  color: "orange"  # Pedestrian color
+
+  # Optional: Use a custom image for pedestrians
+  # Place your image file in ir-sim/irsim/world/description/
+  # description: "person_icon.png"
+
+  # Optional: Set different person counts for specific room types
+  room_overrides:
+    living_room: 3  # More people in living room
+    bedroom: 1      # Fewer in bedrooms
+    kitchen: 2      # Medium in kitchen
+
+# Robot configuration
+robot:
+  - kinematics: {name: 'diff'}  # Differential drive
+    shape: {name: 'circle', radius: 0.3}
+    state: [5, 5, 0]  # Starting position
+    goal: [40, 40, 0]  # Goal position
+    vel_max: [2.0, 1.0]  # Max linear and angular velocity
+    behavior: {name: 'rvo'}  # Reciprocal Velocity Obstacles (avoids pedestrians)
+    color: 'b'
+    plot:
+      show_trail: true
+      show_trajectory: true
+      show_goal: true
+      show_arrow: true
+    sensors:
+      - type: 'lidar2d'
+        range_min: 0.1
+        range_max: 10.0
+        angle_range: 6.28  # 360 degrees
+        number: 360
+        noise: true
+        std: 0.05
+        offset: [0, 0, 0]
+
+# GUI configuration
+gui:
+  keyboard:
+    backend: 'mpl'  # or 'pynput'
+  mouse:
+    backend: 'mpl'
+
+# Plotting configuration
+plot:
+  show_trail: false
+  trail_freq: 5

@@ -111,6 +111,9 @@ class World:
         self._wp.control_mode = control_mode
         self._wp.collision_mode = collision_mode
 
+        # Store HouseExpo map attributes for JuPedSim integration
+        self.map_attr = kwargs.get("map_attr", None)
+
     def step(self) -> None:
         """
         Advance the simulation by one step.
