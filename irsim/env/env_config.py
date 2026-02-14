@@ -17,6 +17,14 @@ if TYPE_CHECKING:
     from irsim.config.env_param import EnvParam
     from irsim.config.world_param import WorldParam
 
+from typing import List, Sequence, Tuple, Optional
+import numpy as np
+
+Box = Tuple[float, float, float, float]  # xmin, ymin, xmax, ymax
+
+def box_center(box: Box) -> Tuple[float, float]:
+    xmin, ymin, xmax, ymax = box
+    return ((xmin + xmax) * 0.5, (ymin + ymax) * 0.5)
 
 class EnvConfig:
     """
@@ -85,7 +93,7 @@ class EnvConfig:
             self.logger.error(
                 f"{self.world_name} YAML File not found!, using default world config as alternative."
             )
-
+    
     def initialize_objects(self) -> Any:
         """Construct world, objects and plot from the current parsed config.
 
@@ -98,14 +106,83 @@ class EnvConfig:
         """
 
         world_kwargs = dict(self.parse["world"])  # copy
+
+        if not isinstance(self.parse.get("obstacle"), list):
+            self.parse["obstacle"] = []
+
+        if not isinstance(self.parse.get("robot"), list):
+            self.parse["robot"] = []
+
         if self.house_expo_path is not None:
-            world_kwargs["obstacle_map"] = os.path.join(
-                self.house_expo_path, "png", self.house_expo_map_name + ".png"
-            )
+            world_kwargs.pop("obstacle_map", None)
             with open(os.path.join(self.house_expo_path, "json", self.house_expo_map_name + ".json"), "r", encoding="utf-8") as f:
                 world_kwargs["map_attr"]  = json.load(f)
-            # world_kwargs["height"]
-            # world_kwargs["width"]
+
+            world_kwargs["width"] = world_kwargs["map_attr"]["bbox"]["min"][0] + world_kwargs["map_attr"]["bbox"]["max"][0]
+            world_kwargs["height"] = world_kwargs["map_attr"]["bbox"]["min"][1] + world_kwargs["map_attr"]["bbox"]["max"][1]
+
+            if not isinstance(self.parse.get("obstacle"), list):
+                self.parse["obstacle"] = []
+
+            print(world_kwargs["map_attr"]["bbox"])
+            print("width: ", world_kwargs["width"], " height: ",world_kwargs["height"])
+
+            rooms = []
+
+            for room_type in world_kwargs["map_attr"]["room_category"].keys():
+                for room in world_kwargs["map_attr"]["room_category"][room_type]:
+                    rooms.append(room)
+
+            seed = None
+            rng = np.random.default_rng(seed)
+            method = "center"
+            xy_noise_std = 0.01,
+            clamp_to_room = True
+
+            # pick a room index uniformly
+            idx = int(rng.integers(0, len(rooms)))
+            box = tuple(map(float, rooms[idx]))  # ensure float
+            xmin, ymin, xmax, ymax = box
+            if xmax <= xmin or ymax <= ymin:
+                raise ValueError(f"Invalid box at idx={idx}: {box}")
+
+            cx, cy = box_center(box)
+
+            if method == "center":
+                    x = cx + rng.normal(0.0, xy_noise_std)
+                    y = cy + rng.normal(0.0, xy_noise_std)
+            elif method == "uniform":
+                # sample anywhere inside the room, then optionally add small noise
+                x = rng.uniform(xmin, xmax) + rng.normal(0.0, xy_noise_std)
+                y = rng.uniform(ymin, ymax) + rng.normal(0.0, xy_noise_std)
+            else:
+                raise ValueError("method must be 'center' or 'uniform'")
+
+            if clamp_to_room:
+                # keep inside bounds (with tiny margin so you don't sit exactly on a wall)
+                eps = 1e-3
+                x = float(np.clip(x, xmin + eps, xmax - eps))
+                y = float(np.clip(y, ymin + eps, ymax - eps))
+            else:
+                x, y = float(x), float(y)
+
+            yaw = float(rng.uniform(-np.pi, np.pi))  # alternative: uniform heading
+
+
+            self.parse["robot"][0]["state"] = [cx, cy, yaw]
+
+
+            verts = world_kwargs["map_attr"]["verts"]
+            
+            verts.append(world_kwargs["map_attr"]["verts"][0])
+
+            self.parse["obstacle"].append({
+                "shape": {"name": "linestring", "vertices": verts},
+                "state": [0.0, 0.0, 0.0],
+                "unobstructed": False,   # outline only (no collision)
+                "color": "royalblue",   # anything but black
+            })
+
 
         world = World(
             self.world_name,
@@ -116,6 +193,7 @@ class EnvConfig:
         robot_collection = self.object_factory.create_from_parse(
             self.parse["robot"], "robot"
         )
+
         obstacle_collection = self.object_factory.create_from_parse(
             self.parse["obstacle"],
             "obstacle",
@@ -165,14 +243,83 @@ class EnvConfig:
         """
 
         world_kwargs = dict(self.parse["world"])  # copy
+
+        if not isinstance(self.parse.get("obstacle"), list):
+            self.parse["obstacle"] = []
+
+        if not isinstance(self.parse.get("robot"), list):
+            self.parse["robot"] = []
+
         if self.house_expo_path is not None:
-            world_kwargs["obstacle_map"] = os.path.join(
-                self.house_expo_path, "png", self.house_expo_map_name + ".png"
-            )
+            world_kwargs.pop("obstacle_map", None)
             with open(os.path.join(self.house_expo_path, "json", self.house_expo_map_name + ".json"), "r", encoding="utf-8") as f:
                 world_kwargs["map_attr"]  = json.load(f)
-            # world_kwargs["height"]
-            # world_kwargs["width"]
+
+            world_kwargs["width"] = world_kwargs["map_attr"]["bbox"]["min"][0] + world_kwargs["map_attr"]["bbox"]["max"][0]
+            world_kwargs["height"] = world_kwargs["map_attr"]["bbox"]["min"][1] + world_kwargs["map_attr"]["bbox"]["max"][1]
+
+            if not isinstance(self.parse.get("obstacle"), list):
+                self.parse["obstacle"] = []
+
+            print(world_kwargs["map_attr"]["bbox"])
+            print("width: ", world_kwargs["width"], " height: ",world_kwargs["height"])
+
+            rooms = []
+
+            for room_type in world_kwargs["map_attr"]["room_category"].keys():
+                for room in world_kwargs["map_attr"]["room_category"][room_type]:
+                    rooms.append(room)
+
+            seed = None
+            rng = np.random.default_rng(seed)
+            method = "center"
+            xy_noise_std = 0.15,
+            yaw_noise_std = 0.10,  # radians
+            clamp_to_room = True
+
+            # pick a room index uniformly
+            idx = int(rng.integers(0, len(rooms)))
+            box = tuple(map(float, rooms[idx]))  # ensure float
+            xmin, ymin, xmax, ymax = box
+            if xmax <= xmin or ymax <= ymin:
+                raise ValueError(f"Invalid box at idx={idx}: {box}")
+
+            cx, cy = box_center(box)
+
+            if method == "center":
+                    x = cx + rng.normal(0.0, xy_noise_std)
+                    y = cy + rng.normal(0.0, xy_noise_std)
+            elif method == "uniform":
+                # sample anywhere inside the room, then optionally add small noise
+                x = rng.uniform(xmin, xmax) + rng.normal(0.0, xy_noise_std)
+                y = rng.uniform(ymin, ymax) + rng.normal(0.0, xy_noise_std)
+            else:
+                raise ValueError("method must be 'center' or 'uniform'")
+
+            if clamp_to_room:
+                # keep inside bounds (with tiny margin so you don't sit exactly on a wall)
+                eps = 1e-3
+                x = float(np.clip(x, xmin + eps, xmax - eps))
+                y = float(np.clip(y, ymin + eps, ymax - eps))
+            else:
+                x, y = float(x), float(y)
+
+            yaw = float(rng.uniform(-np.pi, np.pi))  # alternative: uniform heading
+
+
+            self.parse["robot"][0]["state"] = [cx, cy, yaw]
+
+
+            verts = world_kwargs["map_attr"]["verts"]
+            
+            verts.append(world_kwargs["map_attr"]["verts"][0])
+
+            self.parse["obstacle"].append({
+                "shape": {"name": "linestring", "vertices": verts},
+                "state": [0.0, 0.0, 0.0],
+                "unobstructed": False,   # outline only (no collision)
+                "color": "royalblue",   # anything but black
+            })
 
         world = World(
             self.world_name,
