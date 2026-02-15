@@ -1220,8 +1220,29 @@ class EnvBase:
                 seed=jupedsim_config.get("seed", None),
             )
 
-            # Grid-based robot spawning: Get grid positions for robots
-            robot_positions, robot_grid_indices = self.jupedsim_manager.get_robot_spawn_positions(len(self.robot_list))
+            # Grid-based robot spawning: Extract robot dimensions for collision checking
+            robot_dimensions = []
+            for robot in self.robot_list:
+                # Try to get robot dimensions from geometry bounds
+                if hasattr(robot, '_geometry') and robot._geometry is not None:
+                    # Get bounding box of robot geometry
+                    bounds = robot._geometry.bounds  # (minx, miny, maxx, maxy)
+                    length = bounds[2] - bounds[0]  # maxx - minx
+                    width = bounds[3] - bounds[1]   # maxy - miny
+                    robot_dimensions.append((float(length), float(width)))
+                elif hasattr(robot, 'radius'):
+                    # Circular robot
+                    radius = float(robot.radius)
+                    robot_dimensions.append((radius * 2, radius * 2))
+                else:
+                    # Default conservative dimensions
+                    robot_dimensions.append((1.0, 1.0))
+
+            # Get grid positions for robots with collision validation
+            robot_positions, robot_grid_indices = self.jupedsim_manager.get_robot_spawn_positions(
+                len(self.robot_list),
+                robot_dimensions
+            )
 
             # Reposition robots to grid cell centers
             for i, (x, y, yaw) in enumerate(robot_positions):
@@ -1232,7 +1253,7 @@ class EnvBase:
                     # Update geometry if needed
                     if hasattr(self.robot_list[i], 'gf') and self.robot_list[i].gf is not None:
                         self.robot_list[i]._geometry = self.robot_list[i].gf.step(self.robot_list[i].state)
-                    msg = f"Robot {i} repositioned to grid cell: ({x:.2f}, {y:.2f}, {yaw:.2f})"
+                    msg = f"Robot {i} repositioned to grid cell: ({x:.2f}, {y:.2f}, {yaw:.2f}) with dimensions {robot_dimensions[i]}"
                     self.logger.info(msg)
                     print(msg)
 

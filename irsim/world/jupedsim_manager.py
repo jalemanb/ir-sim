@@ -89,6 +89,13 @@ class JuPedSimManager:
         self.agent_ids: List[int] = []
         self.targets: Dict[int, np.ndarray] = {}
 
+        # Goal diversity tracking
+        self.goal_grid_cells: List[Tuple[float, float]] = []  # Available goal positions (grid cell centers)
+        self.agent_to_goal_idx: Dict[int, int] = {}  # agent_id -> goal_cell_index
+        self.goal_counts: Dict[int, int] = {}  # goal_cell_index -> number of agents assigned
+        self.max_agents_per_goal: int = 1  # Computed during spawning
+        self.step_count: int = 0  # Track simulation steps for periodic logging
+
         self.logger.info(
             f"JuPedSimManager initialized for grid-based spawning with {number_of_agents} agents"
         )
@@ -208,8 +215,72 @@ class JuPedSimManager:
 
         return None  # Failed to find valid point in this cell
 
+    def _get_least_used_goal(self) -> Tuple[int, np.ndarray]:
+        """Get the goal index and position with the fewest agents assigned.
+
+        This ensures goal diversity by preferring goals with fewer agents.
+
+        Returns:
+            Tuple of (goal_index, goal_position) for the least-used goal.
+        """
+        if not self.goal_grid_cells:
+            # Fallback if no goals available
+            bounds = self.building_polygon.bounds
+            xmin, ymin, xmax, ymax = bounds
+            x = self.rng.uniform(xmin, xmax)
+            y = self.rng.uniform(ymin, ymax)
+            return -1, np.array([x, y], dtype=float)
+
+        # Find goals with minimum agent count
+        min_count = min(self.goal_counts.values()) if self.goal_counts else 0
+
+        # Get all goals with the minimum count
+        candidate_indices = [idx for idx, count in self.goal_counts.items() if count == min_count]
+
+        # If no goals have been assigned yet, all valid cells are candidates
+        if not candidate_indices:
+            candidate_indices = list(range(len(self.goal_grid_cells)))
+            # Initialize counts for new goals
+            for idx in candidate_indices:
+                if idx not in self.goal_counts:
+                    self.goal_counts[idx] = 0
+
+        # Randomly select from candidates to avoid bias
+        selected_idx = self.rng.choice(candidate_indices)
+        goal_pos = np.array(self.goal_grid_cells[selected_idx], dtype=float)
+
+        return selected_idx, goal_pos
+
+    def assign_diverse_goal(self, agent_id: int) -> np.ndarray:
+        """Assign a goal to an agent while maintaining diversity.
+
+        Prefers goals with fewer agents assigned to maximize coverage.
+
+        Args:
+            agent_id: The agent to assign a goal to.
+
+        Returns:
+            Goal position as numpy array [x, y].
+        """
+        # Get the least-used goal
+        goal_idx, goal_pos = self._get_least_used_goal()
+
+        # Update tracking
+        if goal_idx >= 0:
+            # Remove agent from old goal if it had one
+            if agent_id in self.agent_to_goal_idx:
+                old_goal_idx = self.agent_to_goal_idx[agent_id]
+                if old_goal_idx in self.goal_counts:
+                    self.goal_counts[old_goal_idx] = max(0, self.goal_counts[old_goal_idx] - 1)
+
+            # Assign to new goal
+            self.agent_to_goal_idx[agent_id] = goal_idx
+            self.goal_counts[goal_idx] = self.goal_counts.get(goal_idx, 0) + 1
+
+        return goal_pos
+
     def sample_goal_from_grid(self) -> np.ndarray:
-        """Sample a random goal from valid grid cell centers.
+        """Sample a random goal from valid grid cell centers (legacy method).
 
         Returns:
             Goal position as numpy array [x, y] (center of a random valid grid cell).
@@ -226,11 +297,33 @@ class JuPedSimManager:
         center_x, center_y = self.rng.choice(self.valid_grid_cells)
         return np.array([center_x, center_y], dtype=float)
 
-    def get_robot_spawn_positions(self, num_robots: int) -> Tuple[List[Tuple[float, float, float]], List[int]]:
-        """Get grid-based spawn positions for robots.
+    def _validate_robot_position(self, x: float, y: float, robot_dimensions: Tuple[float, float]) -> bool:
+        """Check if a robot can fit at a position without colliding with walls.
+
+        Args:
+            x, y: Robot center position.
+            robot_dimensions: (length, width) of the robot in meters.
+
+        Returns:
+            True if robot fits, False if it would collide with walls.
+        """
+        length, width = robot_dimensions
+        # Use the larger dimension as safety radius (conservative approach)
+        safety_radius = max(length, width) / 2.0 + 0.3  # Add 0.3m extra margin
+
+        # Check if a circle of this radius around the robot center is inside the polygon
+        # This is a conservative check that works for any robot orientation
+        robot_circle = Point(x, y).buffer(safety_radius)
+
+        # Robot is valid if the safety circle is fully contained within the building
+        return self.building_polygon.contains(robot_circle)
+
+    def get_robot_spawn_positions(self, num_robots: int, robot_dimensions: List[Tuple[float, float]]) -> Tuple[List[Tuple[float, float, float]], List[int]]:
+        """Get grid-based spawn positions for robots with collision validation.
 
         Args:
             num_robots: Number of robots to spawn.
+            robot_dimensions: List of (length, width) tuples for each robot.
 
         Returns:
             Tuple of (robot_positions, used_indices):
@@ -246,25 +339,62 @@ class JuPedSimManager:
             print(msg)
             return [], []
 
-        # Select random valid grid cells for robots (without replacement)
-        num_to_spawn = min(num_robots, len(self.valid_grid_cells))
-        selected_indices = self.rng.choice(
-            len(self.valid_grid_cells),
-            size=num_to_spawn,
-            replace=False
-        )
-
         robot_positions = []
-        for idx in selected_indices:
-            center_x, center_y = self.valid_grid_cells[idx]
-            yaw = self.rng.uniform(-np.pi, np.pi)  # Random orientation
-            robot_positions.append((float(center_x), float(center_y), float(yaw)))
+        used_indices = []
+        available_indices = set(range(len(self.valid_grid_cells)))
 
-        msg = f"Grid-based robot spawning: {len(robot_positions)} positions generated"
+        for robot_idx in range(num_robots):
+            # Get robot dimensions (or use default if not enough provided)
+            if robot_idx < len(robot_dimensions):
+                dims = robot_dimensions[robot_idx]
+            else:
+                dims = (1.0, 1.0)  # Default dimensions
+
+            # Try to find a valid grid cell for this robot
+            max_attempts = min(50, len(available_indices))
+            found_valid = False
+
+            for attempt in range(max_attempts):
+                if not available_indices:
+                    msg = f"Robot {robot_idx}: No more available grid cells!"
+                    self.logger.warning(msg)
+                    print(msg)
+                    break
+
+                # Randomly select an available cell
+                idx = self.rng.choice(list(available_indices))
+                center_x, center_y = self.valid_grid_cells[idx]
+
+                # Validate that robot fits at this position
+                if self._validate_robot_position(center_x, center_y, dims):
+                    # Valid position found!
+                    yaw = self.rng.uniform(-np.pi, np.pi)
+                    robot_positions.append((float(center_x), float(center_y), float(yaw)))
+                    used_indices.append(idx)
+                    available_indices.remove(idx)
+                    found_valid = True
+                    msg = f"Robot {robot_idx} positioned at grid cell {idx}: ({center_x:.2f}, {center_y:.2f})"
+                    self.logger.info(msg)
+                    print(msg)
+                    break
+                else:
+                    # This cell doesn't work, remove it and try another
+                    available_indices.remove(idx)
+                    if attempt < max_attempts - 1:
+                        msg = f"Robot {robot_idx}: Grid cell {idx} too close to walls (attempt {attempt+1}), trying another..."
+                        self.logger.debug(msg)
+                        print(msg)
+
+            if not found_valid:
+                msg = f"Robot {robot_idx}: ✗ Could not find valid spawn position after {max_attempts} attempts!"
+                self.logger.error(msg)
+                print(msg)
+
+        msg = f"\n{'='*60}\nGrid-based robot spawning: {len(robot_positions)}/{num_robots} robots positioned\n{'='*60}"
         self.logger.info(msg)
         print(msg)
 
-        return robot_positions, selected_indices.tolist()
+        return robot_positions, used_indices
 
     def spawn_pedestrians(self, num_robots: int = 1, robot_grid_indices: Optional[List[int]] = None) -> int:
         """Spawn pedestrians using grid-based spawning.
@@ -288,6 +418,24 @@ class JuPedSimManager:
             self.logger.error(msg)
             print(msg)
             return 0
+
+        # Setup goal diversity system
+        # Use all valid grid cells as potential goals
+        self.goal_grid_cells = self.valid_grid_cells.copy()
+
+        # Compute max agents per goal for optimal distribution
+        num_goals = len(self.goal_grid_cells)
+        if num_goals > 0:
+            self.max_agents_per_goal = int(np.ceil(self.number_of_agents / num_goals))
+        else:
+            self.max_agents_per_goal = 1
+
+        # Initialize goal counts
+        self.goal_counts = {i: 0 for i in range(num_goals)}
+
+        msg = f"Goal diversity: {num_goals} goals available, max {self.max_agents_per_goal} agents per goal"
+        self.logger.info(msg)
+        print(msg)
 
         # Get available cells (excluding those used by robots)
         if robot_grid_indices:
@@ -318,10 +466,7 @@ class JuPedSimManager:
             # Spawn at grid cell center (already validated as inside polygon)
             position = (center_x, center_y)
 
-            # Assign random goal from grid
-            goal_pos = self.sample_goal_from_grid()
-
-            # Create JuPedSim agent
+            # Create JuPedSim agent first to get agent_id
             try:
                 params = jps.CollisionFreeSpeedModelAgentParameters(
                     position=position,
@@ -333,6 +478,9 @@ class JuPedSimManager:
 
                 agent_id = self.sim.add_agent(params)
                 self.agent_ids.append(agent_id)
+
+                # Assign diverse goal (maximizes coverage)
+                goal_pos = self.assign_diverse_goal(agent_id)
                 self.targets[agent_id] = goal_pos
 
                 # Set initial target
@@ -360,18 +508,46 @@ class JuPedSimManager:
         """Advance JuPedSim simulation by one step and update targets."""
         # Step simulation
         self.sim.iterate(1)
+        self.step_count += 1
 
         # Check and update targets for agents that reached their goals
+        goals_reassigned = 0
         for agent_id in self.agent_ids:
             agent = self.sim.agent(agent_id)
             pos = np.array(agent.position, dtype=float)
 
             # Check if agent reached target
             if np.linalg.norm(pos - self.targets[agent_id]) < self.reach_distance:
-                # Assign new goal from grid
-                new_goal = self.sample_goal_from_grid()
+                # Assign new diverse goal (maintains coverage)
+                new_goal = self.assign_diverse_goal(agent_id)
                 self.targets[agent_id] = new_goal
                 agent.target = (float(new_goal[0]), float(new_goal[1]))
+                goals_reassigned += 1
+
+        # Periodic logging of goal distribution (every 200 steps)
+        if self.step_count % 200 == 0:
+            stats = self.get_goal_distribution_stats()
+            self.logger.info(f"Step {self.step_count}: {stats}")
+            print(f"Step {self.step_count}: {stats}")
+
+    def get_goal_distribution_stats(self) -> str:
+        """Get statistics about goal distribution for debugging.
+
+        Returns:
+            String describing current goal distribution.
+        """
+        if not self.goal_counts:
+            return "No goals assigned yet"
+
+        total_assigned = sum(self.goal_counts.values())
+        num_goals_used = sum(1 for count in self.goal_counts.values() if count > 0)
+        max_count = max(self.goal_counts.values()) if self.goal_counts else 0
+        min_count = min(count for count in self.goal_counts.values() if count > 0) if any(self.goal_counts.values()) else 0
+
+        stats = f"Goal Distribution: {num_goals_used}/{len(self.goal_grid_cells)} goals active, "
+        stats += f"{total_assigned} agents assigned (min: {min_count}, max: {max_count}, target: {self.max_agents_per_goal})"
+
+        return stats
 
     def get_agent_states(self) -> Dict[int, Tuple[Tuple[float, float], Tuple[float, float]]]:
         """Get current states of all pedestrian agents.
