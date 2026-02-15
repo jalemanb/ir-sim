@@ -1204,32 +1204,42 @@ class EnvBase:
             return
 
         try:
-            # Create JuPedSim manager
+            # Create JuPedSim manager with grid-based spawning
             # Use JuPedSim-specific step_time if provided, otherwise use world step_time
             jupedsim_step_time = jupedsim_config.get("step_time", self._world.step_time)
 
             self.jupedsim_manager = JuPedSimManager(
                 map_attr=self._world.map_attr,
                 step_time=jupedsim_step_time,
-                persons_per_room=jupedsim_config.get("persons_per_room", 2),
+                number_of_agents=jupedsim_config.get("number_of_agents", 10),
                 pedestrian_radius=jupedsim_config.get("pedestrian_radius", 0.3),
                 pedestrian_speed=jupedsim_config.get("pedestrian_speed", 1.2),
                 reach_distance=jupedsim_config.get("reach_distance", 0.5),
                 wall_margin=jupedsim_config.get("wall_margin", 0.5),
                 avoid_robots=jupedsim_config.get("avoid_robots", True),
                 seed=jupedsim_config.get("seed", None),
-                room_overrides=jupedsim_config.get("room_overrides", None),
             )
 
-            # Get robot positions and dimensions to avoid spawning on top of them
-            robot_positions = []
-            for robot in self.robot_list:
-                radius = getattr(robot, 'radius', 0.5)  # Default 0.5m if not found
-                robot_positions.append((robot.state[0], robot.state[1], radius))
+            # Grid-based robot spawning: Get grid positions for robots
+            robot_positions, robot_grid_indices = self.jupedsim_manager.get_robot_spawn_positions(len(self.robot_list))
 
-            # Spawn pedestrians
+            # Reposition robots to grid cell centers
+            for i, (x, y, yaw) in enumerate(robot_positions):
+                if i < len(self.robot_list):
+                    self.robot_list[i]._state[0] = x
+                    self.robot_list[i]._state[1] = y
+                    self.robot_list[i]._state[2] = yaw
+                    # Update geometry if needed
+                    if hasattr(self.robot_list[i], 'gf') and self.robot_list[i].gf is not None:
+                        self.robot_list[i]._geometry = self.robot_list[i].gf.step(self.robot_list[i].state)
+                    msg = f"Robot {i} repositioned to grid cell: ({x:.2f}, {y:.2f}, {yaw:.2f})"
+                    self.logger.info(msg)
+                    print(msg)
+
+            # Spawn pedestrians using grid (avoid robot grid cells)
             num_spawned = self.jupedsim_manager.spawn_pedestrians(
-                exclude_positions=robot_positions
+                num_robots=len(self.robot_list),
+                robot_grid_indices=robot_grid_indices
             )
 
             # Create ObstaclePedestrian objects for each JuPedSim agent

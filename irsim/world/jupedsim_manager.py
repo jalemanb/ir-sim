@@ -25,27 +25,25 @@ class JuPedSimManager:
     def __init__(self,
                  map_attr: dict,
                  step_time: float = 0.1,
-                 persons_per_room: int = 2,
+                 number_of_agents: int = 10,
                  pedestrian_radius: float = 0.3,
                  pedestrian_speed: float = 1.2,
                  reach_distance: float = 0.5,
                  wall_margin: float = 0.5,
                  avoid_robots: bool = True,
-                 seed: Optional[int] = None,
-                 room_overrides: Optional[Dict[str, int]] = None):
-        """Initialize JuPedSim manager.
+                 seed: Optional[int] = None):
+        """Initialize JuPedSim manager with grid-based spawning.
 
         Args:
-            map_attr: HouseExpo map attributes containing 'verts' and 'room_category'.
+            map_attr: HouseExpo map attributes containing 'verts' and bbox.
             step_time: Simulation time step in seconds.
-            persons_per_room: Default number of pedestrians per room (best effort).
+            number_of_agents: Total number of pedestrian agents to spawn.
             pedestrian_radius: Radius of pedestrian agents in meters.
             pedestrian_speed: Desired walking speed in m/s.
             reach_distance: Distance threshold for goal reassignment.
             wall_margin: Minimum distance from walls in meters.
             avoid_robots: Whether pedestrians should avoid robots during movement.
             seed: Random seed for reproducibility.
-            room_overrides: Dict mapping room type to custom person count.
         """
         if not JUPEDSIM_AVAILABLE:
             raise ImportError(
@@ -55,21 +53,24 @@ class JuPedSimManager:
         self.logger = logging.getLogger(__name__)
         self.map_attr = map_attr
         self.step_time = step_time
-        self.persons_per_room = persons_per_room
+        self.number_of_agents = number_of_agents
         self.pedestrian_radius = pedestrian_radius
         self.pedestrian_speed = pedestrian_speed
         self.reach_distance = reach_distance
         self.wall_margin = wall_margin
         self.avoid_robots = avoid_robots
-        self.room_overrides = room_overrides or {}
         self.rng = np.random.default_rng(seed)
 
         # Robot tracking for avoidance
         self.robot_obstacles = []  # List of JuPedSim obstacle IDs
 
-        # Extract building polygon and rooms
+        # Extract building polygon and bbox
         self.building_polygon = self._load_building_polygon()
-        self.rooms = self._extract_rooms()
+        self.bbox = self._get_bbox()
+
+        # Grid will be computed during spawning based on total entities
+        self.grid_cells = []  # List of (center_x, center_y) for each grid cell
+        self.valid_grid_cells = []  # Grid cells inside building polygon
 
         # Initialize JuPedSim simulation
         self.sim = jps.Simulation(
@@ -87,10 +88,9 @@ class JuPedSimManager:
         # Track agents and their targets
         self.agent_ids: List[int] = []
         self.targets: Dict[int, np.ndarray] = {}
-        self.spawn_rooms: Dict[int, int] = {}  # agent_id -> room_index
 
         self.logger.info(
-            f"JuPedSimManager initialized with {len(self.rooms)} rooms"
+            f"JuPedSimManager initialized for grid-based spawning with {number_of_agents} agents"
         )
 
     def _load_building_polygon(self) -> Polygon:
@@ -117,167 +117,214 @@ class JuPedSimManager:
 
         return poly
 
-    def _extract_rooms(self) -> List[Tuple[str, List[float]]]:
-        """Extract all rooms with their types and bounding boxes.
+    def _get_bbox(self) -> Dict[str, List[float]]:
+        """Get bounding box from map_attr or compute from building polygon.
 
         Returns:
-            List of tuples: (room_type, [xmin, ymin, xmax, ymax])
+            Dict with 'min' and 'max' keys containing [x, y] coordinates.
         """
-        rooms = []
-        for room_type, room_list in self.map_attr["room_category"].items():
-            for room_bbox in room_list:
-                rooms.append((room_type, room_bbox))
-        return rooms
-
-    def sample_point_in_room(self, room_bbox: List[float], margin: float = 0.25) -> Tuple[float, float]:
-        """Sample a random point within a room bounding box.
-
-        Args:
-            room_bbox: [xmin, ymin, xmax, ymax]
-            margin: Margin from walls in meters.
-
-        Returns:
-            (x, y) coordinates within the room.
-        """
-        xmin, ymin, xmax, ymax = room_bbox
-        x = self.rng.uniform(xmin + margin, xmax - margin)
-        y = self.rng.uniform(ymin + margin, ymax - margin)
-        return (float(x), float(y))
-
-    def sample_goal_in_bbox_area(self, margin: float = 0.5) -> np.ndarray:
-        """Sample a random goal position in the bbox interaction area.
-
-        Args:
-            margin: Margin from bbox boundaries in meters.
-
-        Returns:
-            Goal position as numpy array [x, y].
-        """
-        # Use the bbox from map_attr (the interaction area)
-        bbox = self.map_attr.get("bbox", None)
-        if bbox is None:
-            # Fallback to building polygon bounds
+        if "bbox" in self.map_attr:
+            return self.map_attr["bbox"]
+        else:
+            # Compute from building polygon bounds
             bounds = self.building_polygon.bounds
             xmin, ymin, xmax, ymax = bounds
-        else:
-            xmin = bbox["min"][0] + margin
-            ymin = bbox["min"][1] + margin
-            xmax = bbox["max"][0] - margin
-            ymax = bbox["max"][1] - margin
+            return {"min": [xmin, ymin], "max": [xmax, ymax]}
 
-        # Sample random point in bbox
-        x = self.rng.uniform(xmin, xmax)
-        y = self.rng.uniform(ymin, ymax)
-        return np.array([x, y], dtype=float)
-
-    def spawn_pedestrians(self, exclude_positions: Optional[List[Tuple[float, float, float]]] = None) -> int:
-        """Spawn pedestrians in rooms according to configuration.
-
-        Uses JuPedSim's distribute_by_number per room to ensure proper spacing
-        between pedestrians and from walls.
+    def _create_grid(self, num_robots: int):
+        """Create grid based on total number of entities (agents + robots).
 
         Args:
-            exclude_positions: List of (x, y, radius) tuples to avoid (e.g., robot positions).
+            num_robots: Number of robots in the environment.
+        """
+        total_entities = self.number_of_agents + num_robots
+
+        # Compute grid dimensions: create enough cells for all entities with some buffer
+        # Use 1.5x factor to ensure we have more cells than entities
+        grid_dim = int(np.ceil(np.sqrt(total_entities * 1.5)))
+
+        # Get bbox coordinates
+        xmin, ymin = self.bbox["min"]
+        xmax, ymax = self.bbox["max"]
+
+        # Compute cell size
+        cell_width = (xmax - xmin) / grid_dim
+        cell_height = (ymax - ymin) / grid_dim
+
+        # Create grid cell centers
+        self.grid_cells = []
+        self.valid_grid_cells = []
+
+        for i in range(grid_dim):
+            for j in range(grid_dim):
+                # Calculate cell center
+                center_x = xmin + (i + 0.5) * cell_width
+                center_y = ymin + (j + 0.5) * cell_height
+
+                cell_center = (center_x, center_y)
+                self.grid_cells.append(cell_center)
+
+                # Check if center is inside building polygon
+                if self.building_polygon.contains(Point(center_x, center_y)):
+                    self.valid_grid_cells.append(cell_center)
+
+        msg = f"Grid created: {grid_dim}x{grid_dim} = {len(self.grid_cells)} cells, {len(self.valid_grid_cells)} valid cells inside polygon"
+        self.logger.info(msg)
+        print(msg)
+
+        # Store grid parameters for spawn validation
+        self.grid_dim = grid_dim
+        self.cell_width = cell_width
+        self.cell_height = cell_height
+
+    def _sample_point_in_grid_cell(self, grid_idx: int, max_attempts: int = 50) -> Optional[Tuple[float, float]]:
+        """Sample a valid point within a grid cell that's inside the building polygon.
+
+        Args:
+            grid_idx: Index of the grid cell in self.grid_cells.
+            max_attempts: Maximum number of sampling attempts.
+
+        Returns:
+            (x, y) coordinates within the grid cell and inside polygon, or None if failed.
+        """
+        center_x, center_y = self.grid_cells[grid_idx]
+
+        # First try the center
+        if self.building_polygon.contains(Point(center_x, center_y)):
+            return (center_x, center_y)
+
+        # If center is outside, sample random points within the cell
+        xmin = self.bbox["min"][0] + (grid_idx % self.grid_dim) * self.cell_width
+        ymin = self.bbox["min"][1] + (grid_idx // self.grid_dim) * self.cell_height
+        xmax = xmin + self.cell_width
+        ymax = ymin + self.cell_height
+
+        for _ in range(max_attempts):
+            x = self.rng.uniform(xmin, xmax)
+            y = self.rng.uniform(ymin, ymax)
+
+            if self.building_polygon.contains(Point(x, y)):
+                return (float(x), float(y))
+
+        return None  # Failed to find valid point in this cell
+
+    def sample_goal_from_grid(self) -> np.ndarray:
+        """Sample a random goal from valid grid cell centers.
+
+        Returns:
+            Goal position as numpy array [x, y] (center of a random valid grid cell).
+        """
+        if not self.valid_grid_cells:
+            # Fallback to random point if no valid cells
+            bounds = self.building_polygon.bounds
+            xmin, ymin, xmax, ymax = bounds
+            x = self.rng.uniform(xmin, xmax)
+            y = self.rng.uniform(ymin, ymax)
+            return np.array([x, y], dtype=float)
+
+        # Randomly select a valid grid cell center
+        center_x, center_y = self.rng.choice(self.valid_grid_cells)
+        return np.array([center_x, center_y], dtype=float)
+
+    def get_robot_spawn_positions(self, num_robots: int) -> Tuple[List[Tuple[float, float, float]], List[int]]:
+        """Get grid-based spawn positions for robots.
+
+        Args:
+            num_robots: Number of robots to spawn.
+
+        Returns:
+            Tuple of (robot_positions, used_indices):
+                - robot_positions: List of (x, y, yaw) tuples for robot spawn positions
+                - used_indices: List of grid cell indices used by robots
+        """
+        # Create grid first (this also stores it for pedestrian spawning)
+        self._create_grid(num_robots)
+
+        if len(self.valid_grid_cells) == 0:
+            msg = "ERROR: No valid grid cells for robot spawning!"
+            self.logger.error(msg)
+            print(msg)
+            return [], []
+
+        # Select random valid grid cells for robots (without replacement)
+        num_to_spawn = min(num_robots, len(self.valid_grid_cells))
+        selected_indices = self.rng.choice(
+            len(self.valid_grid_cells),
+            size=num_to_spawn,
+            replace=False
+        )
+
+        robot_positions = []
+        for idx in selected_indices:
+            center_x, center_y = self.valid_grid_cells[idx]
+            yaw = self.rng.uniform(-np.pi, np.pi)  # Random orientation
+            robot_positions.append((float(center_x), float(center_y), float(yaw)))
+
+        msg = f"Grid-based robot spawning: {len(robot_positions)} positions generated"
+        self.logger.info(msg)
+        print(msg)
+
+        return robot_positions, selected_indices.tolist()
+
+    def spawn_pedestrians(self, num_robots: int = 1, robot_grid_indices: Optional[List[int]] = None) -> int:
+        """Spawn pedestrians using grid-based spawning.
+
+        Creates a grid over the bbox area and randomly assigns pedestrians to grid cells.
+        Spawns pedestrians at grid cell centers (or samples within cell if center is outside polygon).
+
+        Args:
+            num_robots: Number of robots (used to compute grid size if not already created).
+            robot_grid_indices: Optional list of grid cell indices already used by robots to avoid.
 
         Returns:
             Number of pedestrians spawned.
         """
-        if exclude_positions is None:
-            exclude_positions = []
+        # Create grid if not already created (happens if get_robot_spawn_positions was not called)
+        if not hasattr(self, 'grid_dim') or self.grid_dim is None:
+            self._create_grid(num_robots)
 
-        total_spawned = 0
+        if len(self.valid_grid_cells) == 0:
+            msg = "ERROR: No valid grid cells found inside building polygon!"
+            self.logger.error(msg)
+            print(msg)
+            return 0
 
-        for room_idx, (room_type, room_bbox) in enumerate(self.rooms):
-            # Determine how many people for this room
-            num_people = self.room_overrides.get(room_type, self.persons_per_room)
+        # Get available cells (excluding those used by robots)
+        if robot_grid_indices:
+            available_indices = [i for i in range(len(self.valid_grid_cells)) if i not in robot_grid_indices]
+        else:
+            available_indices = list(range(len(self.valid_grid_cells)))
 
-            msg = f"Room {room_idx} ({room_type}): Attempting to spawn {num_people} pedestrians"
-            self.logger.info(msg)
-            print(msg)  # Also print to console
+        # Check if we have enough valid cells
+        if len(available_indices) < self.number_of_agents:
+            msg = f"WARNING: Only {len(available_indices)} available cells for {self.number_of_agents} agents. Some agents may not spawn."
+            self.logger.warning(msg)
+            print(msg)
 
-            if num_people <= 0:
-                self.logger.info(f"Room {room_idx} ({room_type}): Skipped (num_people=0)")
-                continue
+        # Randomly select grid cells for pedestrians (without replacement)
+        num_to_spawn = min(self.number_of_agents, len(available_indices))
+        selected_cells = self.rng.choice(
+            available_indices,
+            size=num_to_spawn,
+            replace=False
+        )
 
-            # Create polygon for this room
-            xmin, ymin, xmax, ymax = room_bbox
-            room_box = box(xmin, ymin, xmax, ymax)
+        spawned = 0
+        failed = 0
 
-            # Ensure room polygon is valid and inside building
-            room_polygon = room_box.intersection(self.building_polygon)
+        for idx in selected_cells:
+            center_x, center_y = self.valid_grid_cells[idx]
 
-            # Handle different geometry types from intersection
-            if room_polygon.is_empty:
-                msg = f"Room {room_idx} ({room_type}): Skipped (outside building)"
-                print(msg)
-                continue
+            # Spawn at grid cell center (already validated as inside polygon)
+            position = (center_x, center_y)
 
-            if room_polygon.geom_type == "MultiPolygon":
-                # Take the largest piece
-                room_polygon = max(room_polygon.geoms, key=lambda g: g.area)
+            # Assign random goal from grid
+            goal_pos = self.sample_goal_from_grid()
 
-            if room_polygon.geom_type != "Polygon":
-                # Skip non-polygon results (Point, LineString, GeometryCollection)
-                msg = f"Room {room_idx} ({room_type}): Skipped (intersection is {room_polygon.geom_type})"
-                print(msg)
-                continue
-
-            if room_polygon.area < 0.5:  # Reduced from 1.0 to 0.5
-                msg = f"Room {room_idx} ({room_type}): Skipped (too small: {room_polygon.area:.2f}m²)"
-                self.logger.info(msg)
-                print(msg)
-                continue
-
-            # Try to spawn exact number of pedestrians (no partial spawning)
+            # Create JuPedSim agent
             try:
-                # Use JuPedSim's distribute_by_number for proper spacing
-                # Minimum distance between agents = 2 * radius
-                # Distance from walls = wall_margin
-                positions = distribute_by_number(
-                    polygon=room_polygon,
-                    number_of_agents=num_people,
-                    distance_to_agents=max(2 * self.pedestrian_radius, 0.4),  # Min spacing
-                    distance_to_polygon=max(self.wall_margin, 0.4),  # User-configurable wall clearance
-                    seed=self.rng.integers(0, 2**31) if hasattr(self.rng, 'integers') else None,
-                )
-            except Exception as spawn_error:
-                # Cannot place exact number - skip this room entirely
-                msg = f"Room {room_idx} ({room_type}): ✗ Cannot place {num_people} pedestrians (room too small or constrained): {spawn_error}"
-                self.logger.warning(msg)
-                print(msg)
-                continue  # Skip this room entirely
-
-            # Validate all positions first (check for robot proximity)
-            valid_positions = []
-            for pos in positions:
-                too_close = False
-                for ex_x, ex_y, ex_radius in exclude_positions:
-                    # Calculate proper exclusion distance: robot_radius + pedestrian_radius + safety margin
-                    min_distance = ex_radius + self.pedestrian_radius + 0.3  # 0.3m safety margin
-                    distance = np.linalg.norm(np.array(pos) - np.array([ex_x, ex_y]))
-                    if distance < min_distance:
-                        too_close = True
-                        break
-
-                if not too_close:
-                    valid_positions.append(pos)
-
-            # For exact spawning: only spawn if we can place ALL requested pedestrians
-            if len(valid_positions) < num_people:
-                msg = f"Room {room_idx} ({room_type}): ✗ Cannot spawn exact number {num_people} (only {len(valid_positions)} valid positions - {num_people - len(valid_positions)} too close to robot)"
-                self.logger.warning(msg)
-                print(msg)
-                continue  # Skip this room entirely
-
-            # Spawn all pedestrians in this room (we know all positions are valid)
-            room_spawned = 0
-            for pos in valid_positions:
-                # Initial goal in bbox area
-                goal_pos = self.sample_goal_in_bbox_area()
-
-                # Create JuPedSim agent
                 params = jps.CollisionFreeSpeedModelAgentParameters(
-                    position=(float(pos[0]), float(pos[1])),
+                    position=position,
                     desired_speed=self.pedestrian_speed,
                     radius=self.pedestrian_radius,
                     journey_id=self.journey_id,
@@ -287,23 +334,27 @@ class JuPedSimManager:
                 agent_id = self.sim.add_agent(params)
                 self.agent_ids.append(agent_id)
                 self.targets[agent_id] = goal_pos
-                self.spawn_rooms[agent_id] = room_idx
 
                 # Set initial target
                 self.sim.agent(agent_id).target = (float(goal_pos[0]), float(goal_pos[1]))
 
-                total_spawned += 1
-                room_spawned += 1
+                spawned += 1
 
-            # Log success for this room
-            msg = f"Room {room_idx} ({room_type}): ✓ Successfully spawned {room_spawned}/{num_people} pedestrians"
-            self.logger.info(msg)
-            print(msg)
+            except Exception as e:
+                failed += 1
+                self.logger.warning(f"Failed to spawn agent at {position}: {e}")
 
-        msg = f"\n{'='*60}\nSPAWNING COMPLETE: {total_spawned} pedestrians spawned across {len(self.rooms)} rooms\n{'='*60}"
+        msg = f"\n{'='*60}\nGRID-BASED SPAWNING COMPLETE\n"
+        msg += f"Grid: {self.grid_dim}x{self.grid_dim} = {len(self.grid_cells)} total cells\n"
+        msg += f"Valid cells (inside polygon): {len(self.valid_grid_cells)}\n"
+        msg += f"Pedestrians spawned: {spawned}/{self.number_of_agents}\n"
+        if failed > 0:
+            msg += f"Failed spawns: {failed}\n"
+        msg += f"{'='*60}"
         self.logger.info(msg)
         print(msg)
-        return total_spawned
+
+        return spawned
 
     def step(self):
         """Advance JuPedSim simulation by one step and update targets."""
@@ -317,8 +368,8 @@ class JuPedSimManager:
 
             # Check if agent reached target
             if np.linalg.norm(pos - self.targets[agent_id]) < self.reach_distance:
-                # Assign new goal in bbox area
-                new_goal = self.sample_goal_in_bbox_area()
+                # Assign new goal from grid
+                new_goal = self.sample_goal_from_grid()
                 self.targets[agent_id] = new_goal
                 agent.target = (float(new_goal[0]), float(new_goal[1]))
 
