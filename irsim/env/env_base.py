@@ -168,7 +168,17 @@ class EnvBase:
         set_seed(seed)
 
         if not self.display:
-            matplotlib.use("Agg")
+            # Only force Agg when no interactive backend is already active.
+            # If an interactive backend (e.g. TkAgg) was selected at module import,
+            # leaving it in place lets a later render-enabled env open a window.
+            # On a true headless server _set_matplotlib_backend already set Agg, so
+            # this guard is a no-op there.
+            _INTERACTIVE_BACKENDS = {
+                "tkagg", "qt5agg", "qt4agg", "wxagg",
+                "macosx", "gtkagg", "gtk3agg", "gtk4agg",
+            }
+            if matplotlib.get_backend().lower() not in _INTERACTIVE_BACKENDS:
+                matplotlib.use("Agg")
 
         self.disable_all_plot = disable_all_plot
         self.save_ani = save_ani
@@ -186,6 +196,14 @@ class EnvBase:
         except Exception as e:
             self.logger.critical(f"YAML Configuration load failed: {e}")
             raise
+
+        # Apply the YAML world.seed if present — it overrides any kwarg seed so
+        # that a single config file is the source of truth for reproducibility.
+        yaml_seed = self.env_config.seed
+        if yaml_seed is not None:
+            set_seed(yaml_seed)
+        # Store the effective seed so JuPedSim and other sub-systems use the same value.
+        self._effective_seed = yaml_seed if yaml_seed is not None else seed
 
         (
             self._world,
@@ -1217,7 +1235,7 @@ class EnvBase:
                 reach_distance=jupedsim_config.get("reach_distance", 0.5),
                 wall_margin=jupedsim_config.get("wall_margin", 0.5),
                 avoid_robots=jupedsim_config.get("avoid_robots", True),
-                seed=jupedsim_config.get("seed", None),
+                seed=self._effective_seed,
             )
 
             # Grid-based robot spawning: Extract robot dimensions for collision checking

@@ -7,12 +7,13 @@ import numpy as np
 # JuPedSim imports - optional dependency
 try:
     import jupedsim as jps
-    from shapely.geometry import Point, Polygon, box
+    from shapely.geometry import LineString, Point, Polygon, box
     from jupedsim.distributions import distribute_by_number
     JUPEDSIM_AVAILABLE = True
 except ImportError:
     JUPEDSIM_AVAILABLE = False
     jps = None
+    LineString = None
     Point = None
     Polygon = None
     box = None
@@ -95,6 +96,13 @@ class JuPedSimManager:
         self.goal_counts: Dict[int, int] = {}  # goal_cell_index -> number of agents assigned
         self.max_agents_per_goal: int = 1  # Computed during spawning
         self.step_count: int = 0  # Track simulation steps for periodic logging
+
+        # Target pedestrian tracking (the one followed by the range-only sensor)
+        self.target_agent_id: Optional[int] = None
+
+        # Stored after get_robot_spawn_positions() for use in spawn_pedestrians()
+        self._robot_spawn_positions: List[Tuple[float, float, float]] = []
+        self._robot_dimensions: List[Tuple[float, float]] = []
 
         self.logger.info(
             f"JuPedSimManager initialized for grid-based spawning with {number_of_agents} agents"
@@ -394,7 +402,70 @@ class JuPedSimManager:
         self.logger.info(msg)
         print(msg)
 
+        # Store for later use in spawn_pedestrians (target near robot)
+        self._robot_spawn_positions = robot_positions
+        self._robot_dimensions = robot_dimensions
+
         return robot_positions, used_indices
+
+    def _find_position_near_robot(
+        self,
+        robot_x: float,
+        robot_y: float,
+        robot_length: float,
+        robot_width: float,
+        max_attempts: int = 400,
+    ) -> Optional[Tuple[float, float]]:
+        """Sample a valid spawn position adjacent to the robot with clear line-of-sight.
+
+        The candidate point is guaranteed to:
+        - Not physically overlap the robot
+          (clearance = robot_inscribed_radius + ped_radius + 15 cm)
+        - Be inside the building polygon
+        - Respect the configured wall margin
+        - Have an unobstructed straight-line path to the robot
+          (the segment robot→candidate lies entirely inside the building polygon,
+          i.e. no walls cross between them)
+
+        Args:
+            robot_x, robot_y: Robot centre position.
+            robot_length, robot_width: Robot bounding-box dimensions in metres.
+            max_attempts: Max random samples before giving up.
+
+        Returns:
+            (x, y) of a valid spawn point, or None if none found.
+        """
+        robot_radius = max(robot_length, robot_width) / 2.0
+        # Minimum separation: robot radius + pedestrian radius + 15 cm safety gap
+        min_dist = robot_radius + self.pedestrian_radius + 0.15
+        # Search band: up to 2 m beyond the minimum separation
+        max_dist = min_dist + 2.0
+
+        for _ in range(max_attempts):
+            angle = self.rng.uniform(0.0, 2.0 * np.pi)
+            dist = self.rng.uniform(min_dist, max_dist)
+            x = float(robot_x + dist * np.cos(angle))
+            y = float(robot_y + dist * np.sin(angle))
+
+            pt = Point(x, y)
+            if not self.building_polygon.contains(pt):
+                continue
+
+            # Ensure enough clearance from walls
+            if (self.building_polygon.exterior.distance(pt)
+                    < self.wall_margin + self.pedestrian_radius):
+                continue
+
+            # --- Line-of-sight check ---
+            # The straight segment robot→candidate must lie entirely inside the
+            # building polygon (no wall crossing between them).
+            los = LineString([(robot_x, robot_y), (x, y)])
+            if not self.building_polygon.contains(los):
+                continue
+
+            return (x, y)
+
+        return None
 
     def spawn_pedestrians(self, num_robots: int = 1, robot_grid_indices: Optional[List[int]] = None) -> int:
         """Spawn pedestrians using grid-based spawning.
@@ -449,16 +520,72 @@ class JuPedSimManager:
             self.logger.warning(msg)
             print(msg)
 
-        # Randomly select grid cells for pedestrians (without replacement)
-        num_to_spawn = min(self.number_of_agents, len(available_indices))
-        selected_cells = self.rng.choice(
-            available_indices,
-            size=num_to_spawn,
-            replace=False
-        )
-
         spawned = 0
         failed = 0
+        # How many to fill from the grid (may decrease by 1 if target is near robot)
+        grid_count = self.number_of_agents
+
+        # ------------------------------------------------------------------
+        # Spawn the TARGET pedestrian next to the robot (if possible).
+        # This is the agent that the range-only sensor will track.
+        # ------------------------------------------------------------------
+        if self._robot_spawn_positions:
+            rx, ry, _ = self._robot_spawn_positions[0]
+            rl, rw = (
+                self._robot_dimensions[0]
+                if self._robot_dimensions
+                else (1.0, 1.0)
+            )
+            near_pos = self._find_position_near_robot(rx, ry, rl, rw)
+            if near_pos is not None:
+                try:
+                    params = jps.CollisionFreeSpeedModelAgentParameters(
+                        position=near_pos,
+                        desired_speed=self.pedestrian_speed,
+                        radius=self.pedestrian_radius,
+                        journey_id=self.journey_id,
+                        stage_id=self.direct_stage,
+                    )
+                    agent_id = self.sim.add_agent(params)
+                    self.agent_ids.append(agent_id)
+                    self.target_agent_id = agent_id
+
+                    # Assign a diverse goal so the person walks away
+                    goal_pos = self.assign_diverse_goal(agent_id)
+                    self.targets[agent_id] = goal_pos
+                    self.sim.agent(agent_id).target = (
+                        float(goal_pos[0]), float(goal_pos[1])
+                    )
+
+                    spawned += 1
+                    grid_count -= 1  # one fewer from the grid
+                    msg = (
+                        f"Target pedestrian (id={agent_id}) spawned near robot "
+                        f"at ({near_pos[0]:.2f}, {near_pos[1]:.2f}), "
+                        f"goal=({goal_pos[0]:.2f}, {goal_pos[1]:.2f})"
+                    )
+                    self.logger.info(msg)
+                    print(msg)
+                except Exception as e:
+                    self.logger.warning(
+                        "Could not spawn target pedestrian near robot: %s "
+                        "— falling back to grid spawning.", e
+                    )
+            else:
+                self.logger.warning(
+                    "No valid position found near robot for target pedestrian "
+                    "— falling back to grid spawning."
+                )
+
+        # ------------------------------------------------------------------
+        # Spawn remaining pedestrians from grid cells (background crowd)
+        # ------------------------------------------------------------------
+        num_grid = min(grid_count, len(available_indices))
+        selected_cells = self.rng.choice(
+            available_indices,
+            size=num_grid,
+            replace=False
+        )
 
         for idx in selected_cells:
             center_x, center_y = self.valid_grid_cells[idx]
@@ -466,7 +593,6 @@ class JuPedSimManager:
             # Spawn at grid cell center (already validated as inside polygon)
             position = (center_x, center_y)
 
-            # Create JuPedSim agent first to get agent_id
             try:
                 params = jps.CollisionFreeSpeedModelAgentParameters(
                     position=position,
@@ -479,23 +605,26 @@ class JuPedSimManager:
                 agent_id = self.sim.add_agent(params)
                 self.agent_ids.append(agent_id)
 
-                # Assign diverse goal (maximizes coverage)
+                # Assign diverse goal (maximises coverage)
                 goal_pos = self.assign_diverse_goal(agent_id)
                 self.targets[agent_id] = goal_pos
-
-                # Set initial target
-                self.sim.agent(agent_id).target = (float(goal_pos[0]), float(goal_pos[1]))
+                self.sim.agent(agent_id).target = (
+                    float(goal_pos[0]), float(goal_pos[1])
+                )
 
                 spawned += 1
 
             except Exception as e:
                 failed += 1
-                self.logger.warning(f"Failed to spawn agent at {position}: {e}")
+                self.logger.warning("Failed to spawn agent at %s: %s", position, e)
 
         msg = f"\n{'='*60}\nGRID-BASED SPAWNING COMPLETE\n"
         msg += f"Grid: {self.grid_dim}x{self.grid_dim} = {len(self.grid_cells)} total cells\n"
         msg += f"Valid cells (inside polygon): {len(self.valid_grid_cells)}\n"
-        msg += f"Pedestrians spawned: {spawned}/{self.number_of_agents}\n"
+        msg += f"Pedestrians spawned: {spawned}/{self.number_of_agents}"
+        if self.target_agent_id is not None:
+            msg += f"  (target id={self.target_agent_id} spawned near robot)"
+        msg += "\n"
         if failed > 0:
             msg += f"Failed spawns: {failed}\n"
         msg += f"{'='*60}"

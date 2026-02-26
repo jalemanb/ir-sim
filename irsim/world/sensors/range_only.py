@@ -102,9 +102,16 @@ class RangeOnly:
         if jupedsim_mgr is None or len(getattr(jupedsim_mgr, "agent_ids", [])) == 0:
             return
 
-        available = jupedsim_mgr.agent_ids
-        idx = rng.integers(0, len(available))
-        self._target_pedestrian_id = int(available[idx])
+        # Prefer the designated target pedestrian (spawned near the robot).
+        # Fall back to random selection if it is not set.
+        target_id = getattr(jupedsim_mgr, "target_agent_id", None)
+        if target_id is not None and target_id in jupedsim_mgr.agent_ids:
+            self._target_pedestrian_id = int(target_id)
+        else:
+            available = jupedsim_mgr.agent_ids
+            idx = rng.integers(0, len(available))
+            self._target_pedestrian_id = int(available[idx])
+
         self._pedestrian_selected = True
 
     def get_target_position(self) -> Optional[np.ndarray]:
